@@ -1,0 +1,299 @@
+    
+    version: 2.1
+
+    orbs:
+      
+      python: circleci/python@2.1.1
+
+
+    commands:
+
+        npm_dependencies:
+            description: "Install Nodejs and Dependencies"
+
+            steps:
+              - run: 
+                  name: Install npm
+                  command: |
+                           curl -sL https://deb.nodesource.com/setup_14.x | sudo -E bash - \
+                           && sudo apt-get install -y nodejs
+                           
+              - run: 
+                  name: Install dependencies
+                  command: npm install
+        aws_setup:
+          description: "Setup AWS config"
+          
+          steps:
+          - run: 
+              name: Install AWS CLI
+              command: pip3 install awscli --upgrade --user
+              
+          - run:
+              name: Configure AWS Access Key ID
+              command: |
+                aws configure set aws_access_key_id \
+                $AWS_ACCESS_KEY_ID \
+                --profile adludio
+                
+          - run:
+              name: Configure AWS Secret Access Key
+              command: |
+                aws configure set aws_secret_access_key \
+                $AWS_SECRET_ACCESS_KEY \
+                --profile adludio
+                
+          - run:
+              name: Configure AWS default region
+              command: |
+                aws configure set region $AWS_REGION \
+                --profile default
+                      
+
+        python_dev_libraries:
+            description: "System wide python3-dependancy install"
+
+            steps:
+              - run: 
+                  name: Update package manager
+                  command: sudo apt update -y 
+              - run: 
+                  name: Install Python3-Devel Dependency 
+                  command: sudo apt-get install python3-dev  
+
+            
+        miniconda:
+            description: "Install Miniconda"
+            steps:
+              - run: 
+                  name: Download Miniconda
+                  command: mkdir -p ~/miniconda3 && wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda3/miniconda.sh
+                            
+              - run: 
+                  name: Install and Remove Miniconda Script
+                  command: bash ~/miniconda3/miniconda.sh -b -u -p ~/miniconda3  && rm -rf ~/miniconda3/miniconda.sh
+              - run: 
+                  name: Initialize Shell
+                  command: echo 'export PATH=~/miniconda3/bin:$PATH' >> "$BASH_ENV" 
+
+        lint_env:
+            description: "Prepare linting conda enviroment"
+
+            
+            steps:
+              - miniconda
+
+              - run: 
+                  name: Create New Conda Enviroment and Activate
+                  command: conda create --name lint_code-env python=3.7.10 -y 
+
+              - run: 
+                  name: Resource Bash Init 
+                  command: source ~/.bashrc && conda init bash 
+
+        ds_pypi_env:
+            description: "Prepare PyPi conda enviroment"
+
+            
+            steps:
+              - miniconda
+              
+              - run: 
+                  name: Create New Conda Enviroment and Activate
+                  command: conda create --name ds_pypi-env python=3.7.10 -y 
+
+              - run: 
+                  name: Resource Bash Init 
+                  command: source ~/.bashrc && conda init bash 
+        
+        semantic_release:  
+            description: "Install Semantic-Realease"
+            
+            steps:      
+              - run: 
+                  name: Install Semantic-Release 
+                  command: npx semantic-release@18
+
+        commitlint_setup:
+            description: "Setup for commitlint"
+            
+            steps:
+              - restore_cache:
+                    key: lock-{{ checksum "package-lock.json" }}
+              
+              - save_cache:
+                  key: lock-{{ checksum "package-lock.json" }}
+                  paths:
+                    - node_modules
+              - persist_to_workspace:
+                  root: ~/project
+                  paths:
+                    - node_modules      
+            
+        coala_lint:
+            description: "Lint Python files"
+            
+            steps:
+
+            - lint_env
+            
+            - run: 
+                name: Install Coala Linter
+                command: conda run -n lint_code-env pip3 install coala-bears
+              
+            - run: 
+                name: Run Python Coala Bears and Parse Coala output
+                command: |
+                     conda run -n lint_code-env coala | tee ./coala_output.txt || : \
+                     &&  grep -R "Executing section cli..." "./coala_output.txt"
+            
+
+        lint_commit_message:
+            description: "Lint commit messages"
+            
+            steps:
+            - checkout
+            - attach_workspace:
+                at: ~/project
+            - run:
+                name: Define environment variable with lastest commit message
+                command: |
+                  echo 'export COMMIT_MESSAGE=$(git log -1 --pretty=format:"%s")' >> $BASH_ENV
+                  source $BASH_ENV
+            - run:
+                name: Lint commit message
+                command: echo "$COMMIT_MESSAGE" | npx commitlint
+
+        verify_package:
+            description: "Verify this is a Python Package"
+            
+            steps:
+            
+            - run: 
+                name: "Check for setup.py"
+                command: |
+                    SETUP=./setup.py
+                    if  test -f "$SETUP" ; then
+                            echo "$SETUP exists."
+                    else
+                            echo "This is not a Pyhton package.Skipping publish step."
+                            circleci-agent step halt
+                    fi
+
+        pypi_publish:
+            description: "Upload package to private Pypi"
+            
+            steps:
+
+            - verify_package
+            - ds_pypi_env
+            
+            - run: 
+                name: Install Twine
+                command: conda run -n ds_pypi-env pip3 install twine
+
+            - run: 
+                name: Create A Source Distribution
+                command: python3 setup.py sdist
+              
+            - run: 
+                name: Upload To PyPi
+                command: |
+                     conda run -n ds_pypi-env twine upload --username $DS_PYPI_USERNAME --password $DS_PYPI_PASSWORD --repository-url  https://ds.cicd.futureadlabs.com/ dist/*
+
+
+    jobs:
+
+        files_lint: 
+
+            docker:
+              - image: cimg/python:3.7.10
+
+            steps:
+              - checkout
+              
+              # Install Dependency
+              - python_dev_libraries
+              
+              # Lint Python Files
+              - coala_lint
+
+        package_publish: 
+
+            docker:
+              - image: cimg/python:3.7.10
+
+            steps:
+              - checkout
+
+              # Install Dependency
+              - python_dev_libraries
+              
+              # Upload Python Package
+              - pypi_publish
+
+        semantic_version: 
+
+            docker:
+              - image: cimg/python:3.7.10
+
+            steps:
+              - checkout
+
+              # Setup npm 
+              - npm_dependencies
+              
+              # Install Semantic-Release 
+              - semantic_release
+              
+        commit_lint: 
+
+            docker:
+              - image: cimg/python:3.7.10
+
+            steps:
+              - checkout
+              
+              # Setup npm 
+              - npm_dependencies
+
+              # Setup Commitlint 
+              - commitlint_setup
+              
+              # Install npm and Semantic-Release 
+              - lint_commit_message
+              
+              
+      
+
+
+    workflows:
+    
+        lint_version: 
+            jobs:
+
+              - files_lint:
+                 context: adludio-ds-team
+            
+              - commit_lint:
+                  context: adludio-ds-team
+                  
+              - semantic_version:
+                 context: adludio-ds-team
+                 requires:
+                     - files_lint
+                     - commit_lint 
+
+              - package_publish:
+                 context: adludio-ds-team
+                 requires:
+                     - semantic_version
+                 filters:
+                     branches:
+                       only:
+                        - master
+                        - main
+                        - alpha
+                        - beta
+              
+                     
